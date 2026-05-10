@@ -240,28 +240,73 @@ def _sanitize_description_for_storage(description: str, columns: list[str]) -> s
 
 
 def _build_gemini_url() -> str:
-    """
-    Gemini endpoint is configurable to avoid TLS hostname issues when traffic is
-    routed through a proxy. Prefer full override via GEMINI_API_URL; fallback to
-    GEMINI_BASE_URL + GEMINI_MODEL.
-    """
     override = os.getenv("GEMINI_API_URL")
     if override:
         return override
-
     base = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/models/")
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
     base = base.rstrip("/")
-
-    # If caller already provided the full path (including :generateContent) keep it.
     if base.endswith(":generateContent"):
         return base
-
     return f"{base}/{model}:generateContent"
 
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = _build_gemini_url()
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_URL      = _build_gemini_url()
+# When USE_OPENROUTER=true, calls are routed via OpenRouter (openai-compatible)
+# which has no geo-restrictions. Set OPENROUTER_API_KEY on Render.
+USE_OPENROUTER      = os.getenv("USE_OPENROUTER", "false").lower() == "true"
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash-preview")
+OPENROUTER_URL      = "https://openrouter.ai/api/v1/chat/completions"
+
+
+async def _call_openrouter(prompt: str, max_tokens: int = 6000, temperature: float = 0.0) -> dict:
+    """Call Gemini via OpenRouter — no geo-restriction, OpenAI-compatible format."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not configured")
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://fairlensss.netlify.app",
+        "X-Title": "FairLens",
+    }
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(OPENROUTER_URL, headers=headers, json=body)
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text[:400]}")
+    data = resp.json()
+    text = data["choices"][0]["message"]["content"]
+    return extract_json(text)
+
+
+async def _call_openrouter_chat(prompt: str, temperature: float = 0.3, max_tokens: int = 800) -> str:
+    """OpenRouter chat variant — returns raw text (not JSON)."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not configured")
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://fairlensss.netlify.app",
+        "X-Title": "FairLens",
+    }
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(OPENROUTER_URL, headers=headers, json=body)
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text[:400]}")
+    return resp.json()["choices"][0]["message"]["content"]
 
 
 def _unwrap_ssl_error(exc: Exception) -> Optional[ssl.SSLCertVerificationError]:
@@ -1897,6 +1942,9 @@ def merge_into_response(stats, ai, root_causes, bias_origin_dict,
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def call_gemini(prompt: str) -> dict:
+    # Route via OpenRouter if USE_OPENROUTER=true — bypasses geo-restrictions
+    if USE_OPENROUTER:
+        return await _call_openrouter(prompt, max_tokens=6000, temperature=0.0)
     if not GEMINI_API_KEY: raise RuntimeError("GEMINI_API_KEY not configured")
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -1936,7 +1984,6 @@ async def call_gemini(prompt: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run_chat(request: ChatRequest) -> ChatResponse:
-    if not GEMINI_API_KEY: raise RuntimeError("GEMINI_API_KEY not configured")
     ctx = (
         f"You are FairLens, AI fairness auditor.\n"
         f"Dataset: {request.dataset_description}\n"
@@ -1948,11 +1995,19 @@ async def run_chat(request: ChatRequest) -> ChatResponse:
         for m in request.conversation[-MAX_CHAT_TURNS:]
     )
     msg = (request.message or "")[:MAX_CHAT_MESSAGE_CHARS]
+    full_prompt = f"{ctx}\n\n{hist}User: {msg}\n\nAssistant:"
+
+    # Route via OpenRouter if enabled
+    if USE_OPENROUTER:
+        raw_text = await _call_openrouter_chat(full_prompt, temperature=0.3, max_tokens=800)
+        return ChatResponse(response=raw_text)
+
+    if not GEMINI_API_KEY: raise RuntimeError("GEMINI_API_KEY not configured")
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 GEMINI_URL, params={"key": GEMINI_API_KEY},
-                json={"contents": [{"parts": [{"text": f"{ctx}\n\n{hist}User: {msg}\n\nAssistant:"}]}],
+                json={"contents": [{"parts": [{"text": full_prompt}]}],
                       "generationConfig": {"temperature": 0.3, "maxOutputTokens": 800}},
             )
     except httpx.TransportError as exc:
